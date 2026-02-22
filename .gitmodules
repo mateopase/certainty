@@ -14,3 +14,6 @@
 [submodule "examples/uncertaintygo"]
 	path = examples/uncertaintygo
 	url = https://github.com/awonak/UncertaintyGo
+[submodule "examples/teletype"]
+	path = examples/teletype
+	url = https://github.com/monome/teletype
