@@ -60,6 +60,10 @@ struct OutputState {
   OutputMode mode;
 
   uint64_t periodUs;
+  uint64_t lfoAnchorUs;
+  bool ratioPending;
+  uint64_t pendingApplyUs;
+  Ratio pendingRatio;
   uint64_t nextRiseUs;
   uint64_t nextFallUs;
   bool gateHigh;
@@ -91,8 +95,13 @@ static uint32_t g_pwmSliceMask = 0;
 static bool g_pwmTimerRunning = false;
 static volatile bool g_pendingI2cBpm = false;
 static volatile uint16_t g_pendingI2cBpmValue = DEFAULT_BPM;
+static volatile bool g_pendingI2cRatio = false;
+static volatile uint8_t g_pendingI2cRatioOutput = 0;
+static volatile uint8_t g_pendingI2cRatioNum = 1;
+static volatile uint8_t g_pendingI2cRatioDen = 1;
 static volatile uint32_t g_i2cRxCount = 0;
 static volatile uint32_t g_i2cAppliedCount = 0;
+static volatile uint32_t g_i2cRatioAppliedCount = 0;
 static volatile uint32_t g_i2cErrorCount = 0;
 static bool g_i2cEnabled = false;
 
@@ -104,8 +113,10 @@ static bool pwmSampleCallback(repeating_timer *rt);
 static void i2cReceiveHandler(int bytesCount);
 static void i2cRequestHandler();
 static void processPendingI2cBpm();
+static void processPendingI2cRatio();
 static bool tryInitI2cBpmReceiver();
 static void stageMarker(uint8_t count);
+static bool queueRatioChange(uint8_t outIndex, uint8_t num, uint8_t den);
 
 static inline absolute_time_t absoluteFromUs(uint64_t usSinceBoot) {
   absolute_time_t t;
@@ -130,6 +141,33 @@ static inline uint64_t periodFromRatio(uint64_t beatPeriodUs, Ratio ratio) {
     return minPeriod;
   }
   return period;
+}
+
+static inline uint64_t nextBeatBoundaryAfterLocked(uint64_t nowUs) {
+  const uint64_t anchorUs = g_transport.anchorUs;
+  const uint64_t beatUs = g_transport.beatPeriodUs;
+  if (beatUs == 0) {
+    return nowUs + 1;
+  }
+  if ((int64_t)(nowUs - anchorUs) < 0) {
+    return anchorUs;
+  }
+  const uint64_t elapsedUs = nowUs - anchorUs;
+  const uint64_t beatsElapsed = elapsedUs / beatUs;
+  return anchorUs + ((beatsElapsed + 1u) * beatUs);
+}
+
+static inline uint64_t alignToGlobalPhaseGridAtOrAfterLocked(uint64_t atLeastUs, uint64_t periodUs) {
+  const uint64_t anchorUs = g_transport.anchorUs;
+  if (periodUs == 0) {
+    return atLeastUs;
+  }
+  if ((int64_t)(atLeastUs - anchorUs) <= 0) {
+    return anchorUs;
+  }
+  const uint64_t elapsedUs = atLeastUs - anchorUs;
+  const uint64_t steps = (elapsedUs + periodUs - 1u) / periodUs;
+  return anchorUs + (steps * periodUs);
 }
 
 static inline void debugLedInit() {
@@ -266,7 +304,10 @@ static void scheduleNextAlarmLocked() {
     if (out.mode != OUTPUT_MODE_GATE) {
       continue;
     }
-    const uint64_t dueUs = out.gateHigh ? out.nextFallUs : out.nextRiseUs;
+    uint64_t dueUs = out.gateHigh ? out.nextFallUs : out.nextRiseUs;
+    if (out.ratioPending && out.pendingApplyUs < dueUs) {
+      dueUs = out.pendingApplyUs;
+    }
     if (dueUs < nextDueUs) {
       nextDueUs = dueUs;
     }
@@ -297,6 +338,10 @@ static void resetTransportLocked(uint32_t bpm, uint64_t nowUs) {
   for (uint8_t i = 0; i < NUM_OUTPUTS; ++i) {
     OutputState &out = g_outputs[i];
     out.periodUs = periodFromRatio(g_transport.beatPeriodUs, out.ratio);
+    out.lfoAnchorUs = g_transport.anchorUs;
+    out.ratioPending = false;
+    out.pendingApplyUs = g_transport.anchorUs;
+    out.pendingRatio = out.ratio;
     out.nextRiseUs = g_transport.anchorUs;
     out.nextFallUs = g_transport.anchorUs + GATE_PULSE_US;
     out.gateHigh = false;
@@ -321,12 +366,23 @@ static void applyBpmAndReset(uint32_t bpm) {
   restore_interrupts(irqState);
 }
 
+static bool queueRatioChange(uint8_t outIndex, uint8_t num, uint8_t den) {
+  if (outIndex >= NUM_OUTPUTS || num == 0 || den == 0) {
+    return false;
+  }
+  g_pendingI2cRatioOutput = outIndex;
+  g_pendingI2cRatioNum = num;
+  g_pendingI2cRatioDen = den;
+  g_pendingI2cRatio = true;
+  return true;
+}
+
 static void i2cReceiveHandler(int bytesCount) {
   if (bytesCount <= 0) {
     return;
   }
 
-  uint8_t raw[4] = {0, 0, 0, 0};
+  uint8_t raw[6] = {0, 0, 0, 0, 0, 0};
   uint8_t n = 0;
   while (n < sizeof(raw) && n < (uint8_t)bytesCount && g_i2cBus.available()) {
     raw[n++] = (uint8_t)g_i2cBus.read();
@@ -337,33 +393,60 @@ static void i2cReceiveHandler(int bytesCount) {
 
   g_i2cRxCount++;
 
-  uint16_t bpm = 0;
-  bool valid = false;
-
   // Teletype generic I2C layout: first byte is command id.
   // cmd 0 = set BPM, with either:
   // - [0, bpm8] via IISB1
   // - [0, bpm_hi, bpm_lo] via IIS1
-  if (n >= 2 && raw[0] == 0x00 && n < 3) {
-    bpm = raw[1];
-    valid = true;
-  } else if (n >= 3 && raw[0] == 0x00) {
-    bpm = (uint16_t)(((uint16_t)raw[1] << 8) | raw[2]);
-    valid = true;
-  }
+  if (raw[0] == 0x00) {
+    uint16_t bpm = 0;
+    bool valid = false;
+    if (n == 2) {
+      bpm = raw[1];
+      valid = true;
+    } else if (n >= 3) {
+      bpm = (uint16_t)(((uint16_t)raw[1] << 8) | raw[2]);
+      valid = true;
+    }
 
-  if (!valid) {
-    g_i2cErrorCount++;
+    if (!valid || (uint32_t)bpm < MIN_BPM || (uint32_t)bpm > MAX_BPM) {
+      g_i2cErrorCount++;
+      return;
+    }
+
+    g_pendingI2cBpmValue = bpm;
+    g_pendingI2cBpm = true;
     return;
   }
 
-  if ((uint32_t)bpm < MIN_BPM || (uint32_t)bpm > MAX_BPM) {
-    g_i2cErrorCount++;
+  // cmd 1 = set one output ratio: [1, out, num, den]
+  // out accepts 1..8 (user-facing) or 0..7 (zero-based).
+  if (raw[0] == 0x01 && n >= 4) {
+    uint8_t outRaw = raw[1];
+    uint8_t outIndex = 0;
+    if (outRaw >= 1 && outRaw <= NUM_OUTPUTS) {
+      outIndex = (uint8_t)(outRaw - 1);
+    } else if (outRaw < NUM_OUTPUTS) {
+      outIndex = outRaw;
+    } else {
+      g_i2cErrorCount++;
+      return;
+    }
+
+    const uint8_t num = raw[2];
+    const uint8_t den = raw[3];
+    if (num == 0 || den == 0) {
+      g_i2cErrorCount++;
+      return;
+    }
+
+    if (!queueRatioChange(outIndex, num, den)) {
+      g_i2cErrorCount++;
+      return;
+    }
     return;
   }
 
-  g_pendingI2cBpmValue = bpm;
-  g_pendingI2cBpm = true;
+  g_i2cErrorCount++;
 }
 
 static void i2cRequestHandler() {
@@ -403,6 +486,49 @@ static void processPendingI2cBpm() {
   g_i2cAppliedCount++;
 }
 
+static void processPendingI2cRatio() {
+  bool hasPending = false;
+  uint8_t outIndex = 0;
+  uint8_t num = 1;
+  uint8_t den = 1;
+
+  const uint32_t irqState = save_and_disable_interrupts();
+  if (g_pendingI2cRatio) {
+    hasPending = true;
+    outIndex = g_pendingI2cRatioOutput;
+    num = g_pendingI2cRatioNum;
+    den = g_pendingI2cRatioDen;
+    g_pendingI2cRatio = false;
+  }
+  restore_interrupts(irqState);
+
+  if (!hasPending) {
+    return;
+  }
+
+  if (outIndex >= NUM_OUTPUTS || num == 0 || den == 0) {
+    g_i2cErrorCount++;
+    return;
+  }
+
+  const uint64_t nowUs = time_us_64();
+  const uint32_t applyIrqState = save_and_disable_interrupts();
+  OutputState &out = g_outputs[outIndex];
+  const Ratio nextRatio = {(uint16_t)num, (uint16_t)den};
+  const uint64_t applyAtUs = nextBeatBoundaryAfterLocked(nowUs);
+
+  out.pendingRatio = nextRatio;
+  out.pendingApplyUs = applyAtUs;
+  out.ratioPending = true;
+
+  if (out.mode == OUTPUT_MODE_GATE) {
+    scheduleNextAlarmLocked();
+  }
+  restore_interrupts(applyIrqState);
+
+  g_i2cRatioAppliedCount++;
+}
+
 static bool tryInitI2cBpmReceiver() {
   if (g_i2cEnabled) {
     return true;
@@ -433,6 +559,7 @@ static void printStatus() {
   uint32_t pwmRuns = 0;
   uint32_t i2cRx = 0;
   uint32_t i2cApplied = 0;
+  uint32_t i2cRatioApplied = 0;
   uint32_t i2cErr = 0;
 
   uint32_t gateRises[NUM_OUTPUTS];
@@ -451,6 +578,7 @@ static void printStatus() {
   pwmRuns = g_pwmRuns;
   i2cRx = g_i2cRxCount;
   i2cApplied = g_i2cAppliedCount;
+  i2cRatioApplied = g_i2cRatioAppliedCount;
   i2cErr = g_i2cErrorCount;
   for (uint8_t i = 0; i < NUM_OUTPUTS; ++i) {
     gateRises[i] = g_outputs[i].gateRises;
@@ -479,6 +607,8 @@ static void printStatus() {
   Serial.print(i2cRx);
   Serial.print(" i2c_applied=");
   Serial.print(i2cApplied);
+  Serial.print(" i2c_ratio=");
+  Serial.print(i2cRatioApplied);
   Serial.print(" i2c_err=");
   Serial.println(i2cErr);
 
@@ -519,6 +649,7 @@ static void printBriefDiag() {
   uint16_t pwmLevel6 = 0;
   uint16_t pwmLevel8 = 0;
   uint32_t i2cApplied = 0;
+  uint32_t i2cRatioApplied = 0;
   uint32_t i2cErr = 0;
 
   const uint32_t irqState = save_and_disable_interrupts();
@@ -532,6 +663,7 @@ static void printBriefDiag() {
   pwmLevel6 = g_outputs[5].lastPwmLevel;
   pwmLevel8 = g_outputs[7].lastPwmLevel;
   i2cApplied = g_i2cAppliedCount;
+  i2cRatioApplied = g_i2cRatioAppliedCount;
   i2cErr = g_i2cErrorCount;
   restore_interrupts(irqState);
 
@@ -557,6 +689,8 @@ static void printBriefDiag() {
   Serial.print(pwmLevel8);
   Serial.print(" i2c_applied=");
   Serial.print(i2cApplied);
+  Serial.print(" i2c_ratio=");
+  Serial.print(i2cRatioApplied);
   Serial.print(" i2c_err=");
   Serial.println(i2cErr);
 }
@@ -571,13 +705,46 @@ static void handleCommand(const char *cmd) {
     return;
   }
 
+  unsigned long outRaw = 0;
+  unsigned long numRaw = 0;
+  unsigned long denRaw = 0;
+  if (sscanf(cmd, "ratio %lu %lu %lu", &outRaw, &numRaw, &denRaw) == 3) {
+    if (numRaw == 0 || denRaw == 0 || numRaw > 255 || denRaw > 255) {
+      Serial.println("err ratio expects: ratio <out> <num> <den>, num/den in 1..255");
+      return;
+    }
+
+    uint8_t outIndex = 0xFF;
+    if (outRaw >= 1 && outRaw <= NUM_OUTPUTS) {
+      outIndex = (uint8_t)(outRaw - 1);
+    } else if (outRaw < NUM_OUTPUTS) {
+      outIndex = (uint8_t)outRaw;
+    } else {
+      Serial.println("err out expects 1..8 (or 0..7)");
+      return;
+    }
+
+    if (!queueRatioChange(outIndex, (uint8_t)numRaw, (uint8_t)denRaw)) {
+      Serial.println("err failed to queue ratio update");
+      return;
+    }
+
+    Serial.print("ok ratio queued(next beat) out");
+    Serial.print(outIndex + 1);
+    Serial.print("=");
+    Serial.print(numRaw);
+    Serial.print("/");
+    Serial.println(denRaw);
+    return;
+  }
+
   if (strcmp(cmd, "status") == 0) {
     printStatus();
     return;
   }
 
   if (strcmp(cmd, "help") == 0) {
-    Serial.println("commands: bpm <20-320>, status, help");
+    Serial.println("commands: bpm <20-320>, ratio <out> <num> <den>, status, help");
     return;
   }
 
@@ -622,6 +789,16 @@ static int64_t gateAlarmCallback(alarm_id_t id, void *user_data) {
       continue;
     }
 
+    if (out.ratioPending && (int64_t)(nowUs - out.pendingApplyUs) >= 0) {
+      out.ratio = out.pendingRatio;
+      out.periodUs = periodFromRatio(g_transport.beatPeriodUs, out.ratio);
+      out.nextRiseUs = alignToGlobalPhaseGridAtOrAfterLocked(out.pendingApplyUs, out.periodUs);
+      out.nextFallUs = out.nextRiseUs + GATE_PULSE_US;
+      out.gateHigh = false;
+      gpio_put(out.pin, 0);
+      out.ratioPending = false;
+    }
+
     if (out.gateHigh && (int64_t)(nowUs - out.nextFallUs) >= 0) {
       gpio_put(out.pin, 0);
       out.gateHigh = false;
@@ -655,7 +832,6 @@ static bool pwmSampleCallback(repeating_timer *rt) {
   g_pwmRuns++;
 
   const uint64_t nowUs = time_us_64();
-  const uint64_t anchorUs = g_transport.anchorUs;
 
   for (uint8_t i = 0; i < NUM_OUTPUTS; ++i) {
     OutputState &out = g_outputs[i];
@@ -663,7 +839,14 @@ static bool pwmSampleCallback(repeating_timer *rt) {
       continue;
     }
 
-    const uint16_t level = triangleLevelFromPhase(nowUs, anchorUs, out.periodUs);
+    if (out.ratioPending && (int64_t)(nowUs - out.pendingApplyUs) >= 0) {
+      out.ratio = out.pendingRatio;
+      out.periodUs = periodFromRatio(g_transport.beatPeriodUs, out.ratio);
+      out.lfoAnchorUs = g_transport.anchorUs;
+      out.ratioPending = false;
+    }
+
+    const uint16_t level = triangleLevelFromPhase(nowUs, out.lfoAnchorUs, out.periodUs);
     pwm_set_gpio_level(out.pin, level);
     out.lastPwmLevel = level;
     out.lfoUpdates++;
@@ -685,6 +868,10 @@ void setup() {
     out.mode = DEFAULT_MODES[i];
 
     out.periodUs = 0;
+    out.lfoAnchorUs = 0;
+    out.ratioPending = false;
+    out.pendingApplyUs = 0;
+    out.pendingRatio = {1, 1};
     out.nextRiseUs = 0;
     out.nextFallUs = 0;
     out.gateHigh = false;
@@ -741,6 +928,7 @@ void setup() {
   Serial.print("i2c addr=0x");
   Serial.println(I2C_ADDRESS, HEX);
   Serial.println("i2c bpm write: [bpm8] or [bpm_hi bpm_lo] or [0x00 bpm_hi bpm_lo]");
+  Serial.println("i2c ratio write: [0x01 out num den] (out=1..8 or 0..7, applies next beat)");
   if (ENABLE_I2C_BPM) {
     Serial.print("i2c init=deferred, delay_ms=");
     Serial.println(I2C_INIT_DELAY_MS);
@@ -754,7 +942,7 @@ void setup() {
   Serial.println(PWM_SAMPLE_RATE_HZ);
   Serial.print("pwm timer=");
   Serial.println(g_pwmTimerRunning ? "ok" : "failed");
-  Serial.println("commands: bpm <20-320>, status, help");
+  Serial.println("commands: bpm <20-320>, ratio <out> <num> <den>, status, help");
   printStatus();
   stageMarker(7);
 }
@@ -790,6 +978,7 @@ void loop() {
 
   if (ENABLE_I2C_BPM) {
     processPendingI2cBpm();
+    processPendingI2cRatio();
   }
   processSerialCommands();
 
