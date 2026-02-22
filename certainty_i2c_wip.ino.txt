@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+#include <Wire.h>
 #include "hardware/gpio.h"
 #include "hardware/pwm.h"
 #include "hardware/sync.h"
@@ -23,6 +24,19 @@ static const uint8_t PWM_CLKDIV_INT = 12;
 static const uint8_t PWM_CLKDIV_FRAC = 3;
 static const uint32_t PWM_SAMPLE_RATE_HZ = 4000;
 static const int64_t PWM_SAMPLE_PERIOD_US = 1000000 / PWM_SAMPLE_RATE_HZ;
+
+static const uint8_t I2C_ADDRESS = 0x55;
+static const uint8_t I2C_SDA_PIN = 6;
+static const uint8_t I2C_SCL_PIN = 7;
+static const uint8_t I2C_QUEUE_LEN = 8;
+static const uint8_t I2C_MAX_VALUES = 3;
+
+// I2C command byte packs type/output as: command = type*8 + output(0..7)
+enum I2cCommandType : uint8_t {
+  I2C_CMD_SET_BPM = 0,
+  I2C_CMD_SET_RATIO = 1,
+  I2C_CMD_RESET = 2,
+};
 
 enum OutputMode : uint8_t {
   OUTPUT_MODE_GATE = 0,
@@ -68,6 +82,7 @@ struct TransportState {
 
 static OutputState g_outputs[NUM_OUTPUTS];
 static TransportState g_transport = {};
+
 static alarm_id_t g_gateAlarmId = -1;
 static repeating_timer g_pwmTimer = {};
 static volatile uint32_t g_gateSchedulerRuns = 0;
@@ -80,8 +95,24 @@ static bool g_pwmTimerRunning = false;
 static char g_cmdBuffer[32];
 static uint8_t g_cmdLen = 0;
 
+struct I2cCommandPacket {
+  uint8_t command;
+  uint8_t valueCount;
+  uint16_t values[I2C_MAX_VALUES];
+};
+
+static I2cCommandPacket g_i2cQueue[I2C_QUEUE_LEN];
+static volatile uint8_t g_i2cHead = 0;
+static volatile uint8_t g_i2cTail = 0;
+static volatile uint32_t g_i2cRxCount = 0;
+static volatile uint32_t g_i2cDropCount = 0;
+static volatile uint32_t g_i2cHandledCount = 0;
+static volatile uint32_t g_i2cErrorCount = 0;
+
 static int64_t gateAlarmCallback(alarm_id_t id, void *user_data);
 static bool pwmSampleCallback(repeating_timer *rt);
+static void i2cReceiveHandler(int bytesCount);
+static void i2cRequestHandler();
 
 static inline absolute_time_t absoluteFromUs(uint64_t usSinceBoot) {
   absolute_time_t t;
@@ -287,6 +318,83 @@ static void applyBpmAndReset(uint32_t bpm) {
   restore_interrupts(irqState);
 }
 
+static inline bool ratioIsValid(uint16_t num, uint16_t den) {
+  return (num > 0) && (den > 0) && (num <= 64) && (den <= 64);
+}
+
+static void applyRatioAndReset(uint8_t outputIndex, Ratio ratio) {
+  if (outputIndex >= NUM_OUTPUTS) {
+    return;
+  }
+
+  const uint32_t irqState = save_and_disable_interrupts();
+  g_outputs[outputIndex].ratio = ratio;
+  resetTransportLocked(g_transport.bpm, time_us_64());
+  restore_interrupts(irqState);
+}
+
+static void applyTransportReset() {
+  const uint32_t irqState = save_and_disable_interrupts();
+  resetTransportLocked(g_transport.bpm, time_us_64());
+  restore_interrupts(irqState);
+}
+
+static bool popI2cPacket(I2cCommandPacket *packet) {
+  bool hasPacket = false;
+
+  const uint32_t irqState = save_and_disable_interrupts();
+  if (g_i2cTail != g_i2cHead) {
+    *packet = g_i2cQueue[g_i2cTail];
+    g_i2cTail = (uint8_t)((g_i2cTail + 1) % I2C_QUEUE_LEN);
+    hasPacket = true;
+  }
+  restore_interrupts(irqState);
+
+  return hasPacket;
+}
+
+static void handleI2cPacket(const I2cCommandPacket &packet) {
+  const uint8_t commandType = packet.command / NUM_OUTPUTS;
+  const uint8_t outputIndex = packet.command % NUM_OUTPUTS;
+
+  bool handled = false;
+  switch ((I2cCommandType)commandType) {
+    case I2C_CMD_SET_BPM:
+      if (packet.valueCount >= 1) {
+        applyBpmAndReset(packet.values[0]);
+        handled = true;
+      }
+      break;
+    case I2C_CMD_SET_RATIO:
+      if (packet.valueCount >= 2 && ratioIsValid(packet.values[0], packet.values[1])) {
+        Ratio ratio = {packet.values[0], packet.values[1]};
+        applyRatioAndReset(outputIndex, ratio);
+        handled = true;
+      }
+      break;
+    case I2C_CMD_RESET:
+      applyTransportReset();
+      handled = true;
+      break;
+    default:
+      handled = false;
+      break;
+  }
+
+  if (handled) {
+    g_i2cHandledCount++;
+  } else {
+    g_i2cErrorCount++;
+  }
+}
+
+static void processI2cQueue() {
+  I2cCommandPacket packet;
+  while (popI2cPacket(&packet)) {
+    handleI2cPacket(packet);
+  }
+}
+
 static void printStatus() {
   uint32_t bpm = 0;
   uint64_t beatUs = 0;
@@ -295,6 +403,10 @@ static void printStatus() {
   uint32_t gateRuns = 0;
   uint32_t gateMisses = 0;
   uint32_t pwmRuns = 0;
+  uint32_t i2cRx = 0;
+  uint32_t i2cDrops = 0;
+  uint32_t i2cHandled = 0;
+  uint32_t i2cErrors = 0;
 
   uint32_t gateRises[NUM_OUTPUTS];
   uint32_t gateFalls[NUM_OUTPUTS];
@@ -310,6 +422,10 @@ static void printStatus() {
   gateRuns = g_gateSchedulerRuns;
   gateMisses = g_gateSchedulerMisses;
   pwmRuns = g_pwmRuns;
+  i2cRx = g_i2cRxCount;
+  i2cDrops = g_i2cDropCount;
+  i2cHandled = g_i2cHandledCount;
+  i2cErrors = g_i2cErrorCount;
   for (uint8_t i = 0; i < NUM_OUTPUTS; ++i) {
     gateRises[i] = g_outputs[i].gateRises;
     gateFalls[i] = g_outputs[i].gateFalls;
@@ -332,7 +448,15 @@ static void printStatus() {
   Serial.print(" gate_misses=");
   Serial.print(gateMisses);
   Serial.print(" pwm_runs=");
-  Serial.println(pwmRuns);
+  Serial.print(pwmRuns);
+  Serial.print(" i2c_rx=");
+  Serial.print(i2cRx);
+  Serial.print(" i2c_drop=");
+  Serial.print(i2cDrops);
+  Serial.print(" i2c_ok=");
+  Serial.print(i2cHandled);
+  Serial.print(" i2c_err=");
+  Serial.println(i2cErrors);
 
   for (uint8_t i = 0; i < NUM_OUTPUTS; ++i) {
     const OutputState &out = g_outputs[i];
@@ -370,6 +494,8 @@ static void printBriefDiag() {
   uint16_t pwmLevel4 = 0;
   uint16_t pwmLevel6 = 0;
   uint16_t pwmLevel8 = 0;
+  uint32_t i2cHandled = 0;
+  uint32_t i2cErrors = 0;
 
   const uint32_t irqState = save_and_disable_interrupts();
   bpm = g_transport.bpm;
@@ -381,6 +507,8 @@ static void printBriefDiag() {
   pwmLevel4 = g_outputs[3].lastPwmLevel;
   pwmLevel6 = g_outputs[5].lastPwmLevel;
   pwmLevel8 = g_outputs[7].lastPwmLevel;
+  i2cHandled = g_i2cHandledCount;
+  i2cErrors = g_i2cErrorCount;
   restore_interrupts(irqState);
 
   Serial.print("diag bpm=");
@@ -402,16 +530,45 @@ static void printBriefDiag() {
   Serial.print(" tri6=");
   Serial.print(pwmLevel6);
   Serial.print(" tri8=");
-  Serial.println(pwmLevel8);
+  Serial.print(pwmLevel8);
+  Serial.print(" i2c_ok=");
+  Serial.print(i2cHandled);
+  Serial.print(" i2c_err=");
+  Serial.println(i2cErrors);
 }
 
 static void handleCommand(const char *cmd) {
   unsigned long parsedBpm = 0;
+  unsigned long outIndex = 0;
+  unsigned long num = 0;
+  unsigned long den = 0;
   if (sscanf(cmd, "bpm %lu", &parsedBpm) == 1) {
     const uint32_t nextBpm = clampBpm((uint32_t)parsedBpm);
     applyBpmAndReset(nextBpm);
     Serial.print("ok bpm=");
     Serial.println(nextBpm);
+    return;
+  }
+
+  if (sscanf(cmd, "ratio %lu %lu %lu", &outIndex, &num, &den) == 3) {
+    if (outIndex < 1 || outIndex > NUM_OUTPUTS || !ratioIsValid((uint16_t)num, (uint16_t)den)) {
+      Serial.println("err ratio args");
+      return;
+    }
+    Ratio ratio = {(uint16_t)num, (uint16_t)den};
+    applyRatioAndReset((uint8_t)(outIndex - 1), ratio);
+    Serial.print("ok ratio out");
+    Serial.print((uint32_t)outIndex);
+    Serial.print("=");
+    Serial.print((uint32_t)ratio.num);
+    Serial.print("/");
+    Serial.println((uint32_t)ratio.den);
+    return;
+  }
+
+  if (strcmp(cmd, "reset") == 0) {
+    applyTransportReset();
+    Serial.println("ok reset");
     return;
   }
 
@@ -421,7 +578,7 @@ static void handleCommand(const char *cmd) {
   }
 
   if (strcmp(cmd, "help") == 0) {
-    Serial.println("commands: bpm <20-320>, status, help");
+    Serial.println("commands: bpm <20-320>, ratio <1-8> <num> <den>, reset, status, help");
     return;
   }
 
@@ -451,6 +608,50 @@ static void processSerialCommands() {
 
     g_cmdBuffer[g_cmdLen++] = (char)tolower((unsigned char)c);
   }
+}
+
+static void i2cReceiveHandler(int bytesCount) {
+  if (bytesCount <= 0) {
+    return;
+  }
+
+  I2cCommandPacket packet = {};
+  packet.command = (uint8_t)Wire1.read();
+  int remaining = bytesCount - 1;
+
+  while (remaining >= 2 && packet.valueCount < I2C_MAX_VALUES) {
+    const uint16_t hi = (uint16_t)Wire1.read();
+    const uint16_t lo = (uint16_t)Wire1.read();
+    packet.values[packet.valueCount++] = (uint16_t)((hi << 8) | lo);
+    remaining -= 2;
+  }
+
+  while (remaining > 0) {
+    (void)Wire1.read();
+    remaining--;
+  }
+
+  g_i2cRxCount++;
+
+  const uint8_t nextHead = (uint8_t)((g_i2cHead + 1) % I2C_QUEUE_LEN);
+  if (nextHead == g_i2cTail) {
+    g_i2cDropCount++;
+    return;
+  }
+
+  g_i2cQueue[g_i2cHead] = packet;
+  g_i2cHead = nextHead;
+}
+
+static void i2cRequestHandler() {
+  // Minimal 2-byte reply for leader polling: current BPM (big endian)
+  uint16_t bpm = 0;
+  const uint32_t irqState = save_and_disable_interrupts();
+  bpm = (uint16_t)g_transport.bpm;
+  restore_interrupts(irqState);
+
+  uint8_t response[2] = {(uint8_t)(bpm >> 8), (uint8_t)(bpm & 0xFF)};
+  Wire1.write(response, 2);
 }
 
 static int64_t gateAlarmCallback(alarm_id_t id, void *user_data) {
@@ -564,19 +765,27 @@ void setup() {
   g_pwmTimerRunning =
       add_repeating_timer_us(-PWM_SAMPLE_PERIOD_US, pwmSampleCallback, nullptr, &g_pwmTimer);
 
+  Wire1.setSDA(I2C_SDA_PIN);
+  Wire1.setSCL(I2C_SCL_PIN);
+  Wire1.begin(I2C_ADDRESS);
+  Wire1.onReceive(i2cReceiveHandler);
+  Wire1.onRequest(i2cRequestHandler);
+
   applyBpmAndReset(DEFAULT_BPM);
 
   Serial.println("certainty clock phase1+3 foundation");
   Serial.println("defaults: out1/3/5/7 gate, out2/4/6/8 triangle lfo");
   Serial.println("ratios: /2,/2,1x,1x,2x,2x,4x,4x");
+  Serial.print("i2c addr=0x");
+  Serial.println(I2C_ADDRESS, HEX);
+  Serial.println("i2c cmd type*8+out: type0=bpm(u16), type1=ratio(u16,u16), type2=reset");
   Serial.print("pwm carrier hz~");
-  Serial.println(
-      (uint32_t)(125000000u / ((PWM_WRAP + 1u) * (PWM_CLKDIV_INT + (PWM_CLKDIV_FRAC / 16.0f)))));
+  Serial.println((uint32_t)(125000000u / ((PWM_WRAP + 1u) * (PWM_CLKDIV_INT + (PWM_CLKDIV_FRAC / 16.0f)))));
   Serial.print("pwm sample hz=");
   Serial.println(PWM_SAMPLE_RATE_HZ);
   Serial.print("pwm timer=");
   Serial.println(g_pwmTimerRunning ? "ok" : "failed");
-  Serial.println("commands: bpm <20-320>, status, help");
+  Serial.println("commands: bpm <20-320>, ratio <1-8> <num> <den>, reset, status, help");
   printStatus();
 }
 
@@ -585,6 +794,7 @@ void loop() {
   static uint32_t lastStatusMs = 0;
   static bool ledOn = false;
 
+  processI2cQueue();
   processSerialCommands();
 
   const uint32_t now = millis();
